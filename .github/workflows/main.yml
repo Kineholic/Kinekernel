@@ -1,0 +1,319 @@
+# =====================================================================
+# Build GKI Kernel 5.10 — KiirieKRNL-Usepi1
+# =====================================================================
+# Cara pakai:
+# 1. Taruh file ini di repo GitHub kamu sendiri (bukan repo ramabondanp),
+#    di path: .github/workflows/build-kernel.yml
+# 2. Buka tab "Actions" di repo tsb → pilih workflow ini → "Run workflow"
+# 3. Isi/cek input yang muncul (repo kernel, branch, defconfig, dll)
+# 4. Tunggu build selesai, hasil (zip AnyKernel3 + Image) ada di
+#    tab Artifacts / Releases
+#
+# Catatan penting sebelum pakai:
+# - "android12-5.10" adalah branch default repo ramabondanp/android_kernel_common-5.10
+#   (sudah saya cek langsung ke repo-nya). Kalau kamu pakai kernel repo lain,
+#   sesuaikan input kernel_repo & kernel_branch.
+# - Branch SUSFS harus SAMA PERSIS dengan "kelas" GKI kernelnya, contoh untuk
+#   android12-5.10 → susfs branch "gki-android12-5.10".
+# - Nama patch SUSFS mengikuti nama branch: 50_add_susfs_in_<branch>.patch
+# - KernelSU-Next kadang butuh patch susfs versi khusus (beda dari KernelSU resmi)
+#   karena struktur foldernya sedikit beda. Default di sini pakai KernelSU
+#   RESMI (tiann/KernelSU) supaya patch official susfs langsung nempel bersih.
+#   Kalau mau KernelSU-Next, set use_kernelsu_next=true, tapi siapkan sendiri
+#   patch bridging susfs->KernelSU-Next yang cocok versi susfs kamu kalau
+#   patch bawaan gagal apply (lihat log step "Clone SUSFS & apply patch").
+# =====================================================================
+
+name: Build GKI Kernel 5.10 - KiirieKRNL-Usepi1
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "URL repo source kernel (base)"
+        required: true
+        default: "https://github.com/ramabondanp/android_kernel_common-5.10.git"
+      kernel_branch:
+        description: "Branch kernel"
+        required: true
+        default: "android12-5.10"
+      defconfig:
+        description: "Nama file defconfig (di arch/arm64/configs/)"
+        required: true
+        default: "gki_defconfig"
+      susfs_branch:
+        description: "Branch susfs4ksu (harus cocok dgn kelas GKI-nya)"
+        required: true
+        default: "gki-android12-5.10"
+      use_kernelsu_next:
+        description: "Pakai KernelSU-Next? (false = KernelSU resmi/tiann)"
+        required: true
+        type: boolean
+        default: false
+      neutron_clang_tag:
+        description: "Tag release Neutron Clang (kosongkan = latest)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_NAME: "KiirieKRNL-Usepi1"
+  LOCALVERSION: "-KiirieKRNL-Usepi1"
+  KBUILD_BUILD_USER: "KiirieKRNL-Usepi1"
+  KBUILD_BUILD_HOST: "github-actions"
+  ARCH: arm64
+  SUBARCH: arm64
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      # ---------------------------------------------------------------
+      # Runner GitHub Actions cuma punya ~14GB ruang kosong, build kernel
+      # + toolchain bisa gampang penuh. Step ini bebasin ruang lebih dulu.
+      # ---------------------------------------------------------------
+      - name: Bebasin ruang disk runner
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 10240
+          temp-reserve-mb: 2048
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - name: Checkout repo workflow
+        uses: actions/checkout@v4
+
+      - name: Install dependencies build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git \
+            libelf-dev libssl-dev lld llvm ncurses-dev python3 \
+            rsync unzip zip zstd libncurses5-dev libncurses-dev \
+            device-tree-compiler
+
+      - name: Siapkan cache key mingguan
+        id: date
+        run: echo "week=$(date +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ inputs.kernel_branch }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.kernel_branch }}-
+
+      # ---------------------------------------------------------------
+      # 1. Clone kernel source (base dari ramabondanp)
+      # ---------------------------------------------------------------
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" \
+            "${{ inputs.kernel_repo }}" common
+
+      # ---------------------------------------------------------------
+      # 2. Download toolchain Neutron Clang lewat AntMan
+      #    (repo neutron-clang lama sudah deprecated, sekarang resminya
+      #    lewat AntMan yang narik build dari clang-build-catalogue)
+      # ---------------------------------------------------------------
+      - name: Setup cache Neutron Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: neutron-clang
+          key: neutron-clang-${{ inputs.neutron_clang_tag || steps.date.outputs.week }}
+
+      - name: Download Neutron Clang (AntMan)
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p neutron-clang
+          cd neutron-clang
+          curl -LSs "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" -o antman
+          chmod +x antman
+          if [ -n "${{ inputs.neutron_clang_tag }}" ]; then
+            ./antman -S="${{ inputs.neutron_clang_tag }}"
+          else
+            ./antman -S
+          fi
+
+      - name: Tambahkan Neutron Clang ke PATH
+        run: echo "$GITHUB_WORKSPACE/neutron-clang/bin" >> "$GITHUB_PATH"
+
+      # ---------------------------------------------------------------
+      # 3. Clone KernelSU (terbaru) langsung ke root kernel source
+      # ---------------------------------------------------------------
+      - name: Clone KernelSU
+        working-directory: common
+        run: |
+          if [ "${{ inputs.use_kernelsu_next }}" = "true" ]; then
+            echo "==> Menggunakan KernelSU-Next (latest release)"
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          else
+            echo "==> Menggunakan KernelSU resmi (latest tag)"
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          fi
+
+      # ---------------------------------------------------------------
+      # 4. Clone SUSFS lalu apply patch-patchnya
+      # ---------------------------------------------------------------
+      - name: Clone SUSFS & apply patch
+        run: |
+          git clone --depth=1 -b "${{ inputs.susfs_branch }}" \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+          if [ -d common/KernelSU-Next ]; then
+            KSU_DIR="common/KernelSU-Next"
+          else
+            KSU_DIR="common/KernelSU"
+          fi
+          echo "KSU_DIR terdeteksi: $KSU_DIR"
+
+          # Patch integrasi susfs -> KernelSU
+          cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KSU_DIR/"
+          ( cd "$KSU_DIR" && patch -p1 --forward < 10_enable_susfs_for_ksu.patch ) \
+            || echo "⚠️  Patch KernelSU gagal auto-apply. Kalau pakai KernelSU-Next, cek patch bridging versi susfs terbaru secara manual."
+
+          # Patch utama susfs ke kernel common
+          SUSFS_PATCH="50_add_susfs_in_${{ inputs.susfs_branch }}.patch"
+          cp "susfs4ksu/kernel_patches/$SUSFS_PATCH" common/
+          cp susfs4ksu/kernel_patches/fs/* common/fs/
+          cp susfs4ksu/kernel_patches/include/linux/* common/include/linux/
+          ( cd common && patch -p1 --forward < "$SUSFS_PATCH" ) \
+            || echo "⚠️  Ada hunk yang gagal apply, cek file .rej di folder common/"
+
+      # ---------------------------------------------------------------
+      # 5. Enable config KernelSU + SUSFS di defconfig
+      #    (baseline umum, cek ulang ke susfs4ksu README kalau ada
+      #    opsi yang berubah nama di versi susfs terbaru)
+      # ---------------------------------------------------------------
+      - name: Enable config KernelSU & SUSFS
+        working-directory: common
+        run: |
+          DEFCONFIG="arch/arm64/configs/${{ inputs.defconfig }}"
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_PROC_CMDLINE=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_TMPFS_XATTR=y"
+            echo "# CONFIG_MODULE_SIG is not set"
+          } >> "$DEFCONFIG"
+
+      # ---------------------------------------------------------------
+      # 6. Set LOCALVERSION / nama kernel = KiirieKRNL-Usepi1
+      # ---------------------------------------------------------------
+      - name: Set localversion & nama kernel
+        working-directory: common
+        run: |
+          echo "$LOCALVERSION" > localversion
+
+      # ---------------------------------------------------------------
+      # 7. Build kernel pakai Neutron Clang (full LLVM toolchain)
+      # ---------------------------------------------------------------
+      - name: Build kernel
+        working-directory: common
+        run: |
+          export PATH="$GITHUB_WORKSPACE/neutron-clang/bin:$PATH"
+          export KBUILD_BUILD_USER="$KBUILD_BUILD_USER"
+          export KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST"
+
+          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CC="ccache clang" "${{ inputs.defconfig }}"
+
+          # Matikan auto-append hash git supaya localversion bersih
+          scripts/config --file out/.config -d LOCALVERSION_AUTO
+          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CC="ccache clang" olddefconfig
+
+          make -j"$(nproc --all)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            2>&1 | tee build.log
+
+      - name: Cek hasil build
+        working-directory: common
+        run: |
+          IMG=$(find out/arch/arm64/boot -maxdepth 1 -type f \
+            \( -name "Image" -o -name "Image.gz" -o -name "Image.lz4" \) \
+            | sort | head -n1)
+          if [ -z "$IMG" ]; then
+            echo "❌ Build gagal, file Image tidak ditemukan. Cek common/build.log"
+            exit 1
+          fi
+          echo "✅ Build sukses: $IMG"
+          echo "IMG_PATH=$IMG" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 8. Bungkus jadi flashable zip pakai AnyKernel3
+      # ---------------------------------------------------------------
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/README.md
+
+      - name: Susun anykernel.sh
+        run: |
+          cat > AnyKernel3/anykernel.sh << EOF
+          properties() { '
+          kernel.string=${KERNEL_NAME}
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          block=boot
+          is_slot_device=1
+          '; }
+
+          . tools/ak3-core.sh
+
+          dump_boot
+          write_boot
+          EOF
+          cp "common/$IMG_PATH" AnyKernel3/Image
+
+      - name: Zip AnyKernel3
+        run: |
+          cd AnyKernel3
+          ZIP_NAME="${KERNEL_NAME}-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../$ZIP_NAME" ./* -x ".git*"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 9. Upload hasil build
+      # ---------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}
+          path: |
+            ${{ env.ZIP_NAME }}
+            common/${{ env.IMG_PATH }}
+            common/build.log
+
+      - name: Buat GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.KERNEL_NAME }}-${{ github.run_number }}
+          name: "${{ env.KERNEL_NAME }} build #${{ github.run_number }}"
+          files: |
+            ${{ env.ZIP_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
