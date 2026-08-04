@@ -1,0 +1,233 @@
+name: Build GKI Kernel 5.10 with KernelSU-Next & SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'Kernel branch to build'
+        required: true
+        default: 'android12-5.10'
+      neutron_tag:
+        description: 'Neutron Clang release tag (e.g. 11032023 for LLVM 17, or latest)'
+        required: true
+        default: 'latest'
+      ksun_branch:
+        description: 'KernelSU-Next branch/tag'
+        required: true
+        default: 'next'
+      susfs_tag:
+        description: 'SUSFS tag for gki-android12-5.10'
+        required: true
+        default: '1.4.2-gki-android12-5.10'
+      localversion:
+        description: 'Kernel localversion/name'
+        required: true
+        default: 'KiirieKRNL-Usepi1'
+      release:
+        description: 'Create GitHub Release?'
+        required: true
+        default: 'true'
+
+env:
+  KERNEL_NAME: KiirieKRNL-Usepi1
+  KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+  NEUTRON_TAG: ${{ github.event.inputs.neutron_tag }}
+  KSUN_BRANCH: ${{ github.event.inputs.ksun_branch }}
+  SUSFS_TAG: ${{ github.event.inputs.susfs_tag }}
+  LOCALVERSION: ${{ github.event.inputs.localversion }}
+  TZ: Asia/Jakarta
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ramabondanp/android_kernel_common-5.10
+          ref: ${{ env.KERNEL_BRANCH }}
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev libtinfo5 device-tree-compiler libfdt-dev python3 python-is-python3
+
+      - name: Setup Neutron Clang
+        run: |
+          mkdir -p $HOME/toolchains/neutron-clang
+          cd $HOME/toolchains/neutron-clang
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          if [ "${{ env.NEUTRON_TAG }}" = "latest" ]; then
+            ./antman -S
+          else
+            ./antman -S=${{ env.NEUTRON_TAG }}
+          fi
+          ./antman -I
+          echo "PATH=$HOME/toolchains/neutron-clang/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Setup KernelSU-Next
+        run: |
+          cd $GITHUB_WORKSPACE
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s ${{ env.KSUN_BRANCH }}
+          echo "KernelSU-Next setup done"
+
+      - name: Clone SUSFS
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 -b ${{ env.SUSFS_TAG }} https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          echo "SUSFS cloned"
+
+      - name: Apply SUSFS patches
+        run: |
+          cd $GITHUB_WORKSPACE
+
+          # Copy SUSFS kernel files
+          cp -r susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
+          cp -r susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+
+          # Apply main SUSFS patch to kernel
+          for patch in susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch \
+                       susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch \
+                       susfs4ksu/kernel_patches/*.patch; do
+            if [ -f "$patch" ]; then
+              echo "Applying patch: $patch"
+              patch -p1 < "$patch" || true
+            fi
+          done
+
+          # Apply SUSFS patch to KernelSU-Next if available
+          if [ -d "KernelSU-Next" ]; then
+            cd KernelSU-Next
+            for patch in ../susfs4ksu/kernel_patches/KernelSU-Next/*.patch \
+                         ../susfs4ksu/kernel_patches/KernelSU/*.patch \
+                         ../susfs4ksu/kernel_patches/10_enable_susfs_for_ksu.patch; do
+              if [ -f "$patch" ]; then
+                echo "Applying KSU patch: $patch"
+                patch -p1 < "$patch" || true
+              fi
+            done
+            cd ..
+          fi
+
+          echo "SUSFS patches applied"
+
+      - name: Set kernel localversion & name
+        run: |
+          cd $GITHUB_WORKSPACE
+
+          # Set localversion in defconfig
+          echo "CONFIG_LOCALVERSION=\"-${{ env.LOCALVERSION }}\"" >> arch/arm64/configs/gki_defconfig
+
+          # Set default hostname
+          sed -i "s/CONFIG_DEFAULT_HOSTNAME=\".*/CONFIG_DEFAULT_HOSTNAME=\"${{ env.LOCALVERSION }}\"/g" arch/arm64/configs/gki_defconfig || \
+            echo "CONFIG_DEFAULT_HOSTNAME=\"${{ env.LOCALVERSION }}\"" >> arch/arm64/configs/gki_defconfig
+
+          # Set kernel name in Makefile if you want to override uname
+          sed -i "s/^EXTRAVERSION =.*/EXTRAVERSION = -${{ env.LOCALVERSION }}/g" Makefile 2>/dev/null || true
+
+          echo "Localversion set to: ${{ env.LOCALVERSION }}"
+
+      - name: Enable KernelSU & SUSFS in defconfig
+        run: |
+          cd $GITHUB_WORKSPACE
+          cat >> arch/arm64/configs/gki_defconfig << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+          EOF
+          echo "KernelSU & SUSFS config enabled"
+
+      - name: Build kernel
+        run: |
+          cd $GITHUB_WORKSPACE
+          export PATH=$HOME/toolchains/neutron-clang/bin:$PATH
+
+          # Export build environment
+          export CC=clang
+          export CXX=clang++
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export STRIP=llvm-strip
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export READELF=llvm-readelf
+          export HOSTAR=llvm-ar
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+          export HOSTLD=ld.lld
+          export LD=ld.lld
+          export LLVM=1
+          export LLVM_IAS=1
+
+          # For GKI 5.10-android12, use build.sh (official method)
+          # Using thin LTO to save memory on GitHub Actions
+          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
+
+          echo "Build completed"
+          ls -la out/android12-5.10/dist/ || ls -la out/dist/ || find out -name "Image" -o -name "Image.gz"
+
+      - name: Prepare AnyKernel3
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+
+          # Find and copy kernel image
+          if [ -f "out/android12-5.10/dist/Image" ]; then
+            cp out/android12-5.10/dist/Image anykernel/
+          elif [ -f "out/android12-5.10/dist/Image.gz" ]; then
+            cp out/android12-5.10/dist/Image.gz anykernel/
+          elif [ -f "out/dist/Image" ]; then
+            cp out/dist/Image anykernel/
+          elif [ -f "out/dist/Image.gz" ]; then
+            cp out/dist/Image.gz anykernel/
+          fi
+
+          # Customize AnyKernel3
+          sed -i "s/ExampleKernel by osm0sis/${{ env.LOCALVERSION }}/g" anykernel/anykernel.sh 2>/dev/null || true
+          sed -i "s/ExampleKernel/${{ env.LOCALVERSION }}/g" anykernel/anykernel.sh 2>/dev/null || true
+
+          cd anykernel
+          zip -r9 ../${{ env.KERNEL_NAME }}.zip * -x '*.git*' -x 'README*' -x 'LICENSE*'
+          cd ..
+          echo "AnyKernel3 package created"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}
+          path: |
+            ${{ github.workspace }}/${{ env.KERNEL_NAME }}.zip
+            ${{ github.workspace }}/out/**/dist/Image*
+          if-no-files-found: warn
+
+      - name: Create Release
+        if: github.event.inputs.release == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.LOCALVERSION }}-${{ github.run_number }}
+          name: "${{ env.LOCALVERSION }} Build #${{ github.run_number }}"
+          body: |
+            ## ${{ env.LOCALVERSION }}
+            - **Base Kernel:** ramabondanp/android_kernel_common-5.10 (${{ env.KERNEL_BRANCH }})
+            - **Compiler:** Neutron Clang (${{ env.NEUTRON_TAG }})
+            - **KernelSU-Next:** ${{ env.KSUN_BRANCH }}
+            - **SUSFS:** ${{ env.SUSFS_TAG }}
+            - **Localversion:** ${{ env.LOCALVERSION }}
+            - **Build Date:** ${{ github.event.repository.updated_at }}
+          files: |
+            ${{ github.workspace }}/${{ env.KERNEL_NAME }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
