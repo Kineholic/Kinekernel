@@ -1,0 +1,146 @@
+name: Build GKI 5.10 Kernel
+
+on:
+  workflow_dispatch: # Bisa dijalankan secara manual dari tab Actions
+  push:
+    branches:
+      - main
+
+env:
+  # ================= KONFIGURASI ENVIRONMENT =================
+  KERNEL_REPO_URL: "https://github.com/ramabondp/android_kernel_common-android12-5.10"
+  KERNEL_BRANCH: "android12-5.10"
+  KERNEL_DEFCONFIG: "gki_defconfig"
+  LOCAL_VERSION: "-NeutronClang12-SUSFS-KSUNext"
+  CLANG_VERSION: "12"
+  ARCH: "arm64"
+  # ==========================================================
+
+jobs:
+  build:
+    name: Build GKI Kernel
+    runs-on: ubuntu-22.04
+    steps:
+      
+      - name: Checkout Workflow
+        uses: actions/checkout@v4
+
+      - name: Maximize Build Space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo apt-get clean
+          df -h
+
+      - name: Setup Swap RAM (10GB)
+        run: |
+          sudo swapoff -a
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y bc bison build-essential ccache cpio flex git libelf-dev libfdt-dev libncurses-dev libssl-dev lld llvm python3 zip zstd zsh
+
+      - name: Setup Environment Variables
+        run: |
+          echo "HOME=$HOME" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_USER=github-actions" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_HOST=github-runner" >> $GITHUB_ENV
+
+      - name: Clone Kernel Source (ramabondp)
+        run: |
+          git clone --depth=1 ${{ env.KERNEL_REPO_URL }} -b ${{ env.KERNEL_BRANCH }} kernel
+          cd kernel
+          echo "Kernel source cloned successfully."
+
+      - name: Download Neutron Clang 12
+        run: |
+          mkdir -p ~/toolchains
+          cd ~/toolchains
+          # Mengambil Neutron Clang 12.0.1
+          wget -q https://github.com/Neutron-Toolchains/clang-build-catalogue/raw/main/neutron-clang-12.0.1.tar.zst
+          tar --use-compress-program=unzstd -xf neutron-clang-12.0.1.tar.zst
+          rm neutron-clang-12.0.1.tar.zst
+          echo "Neutron Clang 12 downloaded and extracted."
+
+      - name: Integrate KernelSU-Next
+        run: |
+          cd kernel
+          # Menggunakan script official KernelSU-Next
+          curl -LSs "https://raw.githubusercontent.com/kernel-su/KernelSU-Next/main/kernel/setup.sh" | bash -s main-next
+          echo "KernelSU-Next integrated."
+
+      - name: Integrate SUSFS
+        run: |
+          cd kernel
+          # Clone SUSFS (Ganti URL jika ada fork khusus yang Anda pakai)
+          git clone --depth=1 https://github.com/sidneysicen/susfs4ksu.git susfs
+          
+          # Copy file SUSFS ke source kernel
+          cp susfs/fs/susfs.c fs/
+          cp susfs/include/uapi/linux/susfs.h include/uapi/linux/
+          
+          # Apply patches SUSFS ke Makefile dan Kconfig
+          bash susfs/apply.sh
+          
+          echo "SUSFS integrated."
+
+      - name: Set Local Version
+        run: |
+          cd kernel
+          # Hapus localversion default jika ada
+          sed -i 's/^CONFIG_LOCALVERSION=".*"/CONFIG_LOCALVERSION="${{ env.LOCAL_VERSION }}"/g' arch/${{ env.ARCH }}/configs/${{ env.KERNEL_DEFCONFIG }}
+          
+          # Tambahkan config SUSFS & KSU secara manual ke defconfig jika belum ada
+          echo "CONFIG_KSU=y" >> arch/${{ env.ARCH }}/configs/${{ env.KERNEL_DEFCONFIG }}
+          echo "CONFIG_KSU_SUSFS=y" >> arch/${{ env.ARCH }}/configs/${{ env.KERNEL_DEFCONFIG }}
+          
+          echo "Local version set to: ${{ env.LOCAL_VERSION }}"
+
+      - name: Build Kernel
+        run: |
+          cd kernel
+          PATH=~/toolchains/neutron-clang-12.0.1/bin:$PATH
+          
+          make O=out ARCH=${{ env.ARCH }} ${{ env.KERNEL_DEFCONFIG }}
+          
+          # Build menggunakan LLVM
+          make -j$(nproc) O=out \
+            ARCH=${{ env.ARCH }} \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          # Hapus image dummy bawaan AnyKernel3
+          rm -rf AnyKernel3/.git
+          echo "AnyKernel3 cloned."
+
+      - name: Package Kernel
+        run: |
+          cp kernel/out/arch/${{ env.ARCH }}/boot/Image AnyKernel3/
+          cd AnyKernel3
+          # Edit AnyKernel3 config untuk flash via fastboot
+          sed -i 's/block=auto/block=auto/g' tools/ak3_core.sh
+          sed -i 's/is_slot_device=auto;/is_slot_device=auto;/g' tools/ak3_core.sh
+          
+          ZIP_NAME="GKI-5.10-ramabondp${{ env.LOCAL_VERSION }}-$(date +'%Y%m%d').zip"
+          zip -r9 $ZIP_NAME * -x .git README.md *placeholder
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload Kernel Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: AnyKernel3/${{ env.ZIP_NAME }}
+          retention-days: 30
